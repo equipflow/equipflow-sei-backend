@@ -168,6 +168,7 @@ ENABLE_SITEMAP = True
 ENABLE_BUDGET_CONTROL = True
 ENABLE_SAFE_PUBLISHING = True
 ENABLE_FEEDBACK_LOOP = True
+ENABLE_AUTO_KNOWLEDGE = True  # Auto-ingest to Ava KB on publish
 
 # Safety settings
 MAX_PAGES_PER_RUN = 50
@@ -2476,6 +2477,103 @@ def prepare_webflow_payload(node: Dict) -> Dict:
     return payload
 
 
+def ingest_to_ava_knowledge(node_id: str) -> Dict:
+    """
+    Auto-ingest published content into Ava's knowledge base (kb_chunks).
+    Replicates logic from sei_chunking_final.py for consistency.
+    """
+    result = {'success': False, 'chunks_created': 0}
+    
+    try:
+        # 1. Get node data
+        node = supabase.table('decision_nodes').select('*').eq('id', node_id).single().execute()
+        if not node.data:
+            return result
+        
+        node_data = node.data
+        primary_keyword = node_data.get('primary_keyword', 'equipment')
+        equipment_type_id = node_data.get('equipment_type_id')
+        
+        # 2. Extract content
+        content = node_data.get('generated_content', {})
+        if isinstance(content, str):
+            try:
+                content = json.loads(content) if content else {}
+            except:
+                content = {}
+        
+        if not content:
+            return result
+
+        # 3. Clean and Chunk
+        def clean_text(text: str) -> str:
+            if not text: return ""
+            clean = re.sub(r'<[^>]+>', '', text)
+            return re.sub(r'\s+', ' ', clean).strip()
+
+        chunks = []
+        intent = (node_data.get('spoke_type') or 'hub').replace('-', '_').lower()
+        slug = node_data.get('url_slug') or primary_keyword.lower().replace(' ', '-')
+
+        # Intro
+        intro = clean_text(content.get('intro', ''))
+        if len(intro) > 50:
+            chunks.append({'type': 'intro', 'content': f"Overview of {primary_keyword}: {intro}"})
+        
+        # Main Content (split into paragraphs)
+        main = clean_text(content.get('main_content', ''))
+        if len(main) > 100:
+            paras = [p.strip() for p in re.split(r'\n\n+|\. (?=[A-Z])', main) if len(p.strip()) > 50]
+            for p in paras[:5]:
+                chunks.append({'type': 'main', 'content': f"{primary_keyword} info: {p}"})
+        
+        # FAQ
+        faqs = content.get('faq', [])
+        if isinstance(faqs, list):
+            for faq in faqs[:5]:
+                q, a = faq.get('question', faq.get('q')), faq.get('answer', faq.get('a'))
+                if q and a:
+                    chunks.append({'type': 'faq', 'content': f"Q: {q}\nA: {a}"})
+
+        # 4. Embed and Store
+        if not chunks:
+            return result
+
+        # Delete existing chunks for this node
+        supabase.table('kb_chunks').delete().eq('decision_node_id', node_id).execute()
+
+        for chunk in chunks:
+            # Generate embedding using OpenAI
+            if not openai_client: continue
+            
+            try:
+                resp = openai_client.embeddings.create(
+                    input=[chunk['content'].replace("\n", " ")[:8000]],
+                    model="text-embedding-3-small"
+                )
+                embedding = resp.data[0].embedding
+                
+                supabase.table('kb_chunks').insert({
+                    'decision_node_id': node_id,
+                    'equipment_type_id': equipment_type_id,
+                    'equipment_slug': slug,
+                    'intent': intent,
+                    'chunk_type': chunk['type'],
+                    'content': chunk['content'],
+                    'embedding': embedding
+                }).execute()
+                result['chunks_created'] += 1
+            except Exception as e:
+                log(Status.WARN, f"Embedding error: {e}", indent=2)
+
+        result['success'] = True
+        log(Status.BRAIN, f"Ingested {result['chunks_created']} chunks to Ava KB", indent=1)
+        return result
+
+    except Exception as e:
+        log(Status.WARN, f"Ingestion error: {e}", indent=1)
+        return result
+
 def publish_to_webflow(node_id: str) -> Dict:
     """Publish a single node to Webflow"""
     result = {'success': False, 'node_id': node_id}
@@ -2563,6 +2661,10 @@ def publish_to_webflow(node_id: str) -> Dict:
             # Ping IndexNow for instant indexing
             if ENABLE_INDEXNOW and INDEXNOW_KEY:
                 ping_indexnow_single(result['url'])
+            
+            # Auto-ingest to Ava Knowledge Base
+            if ENABLE_AUTO_KNOWLEDGE:
+                ingest_to_ava_knowledge(node_id)
         else:
             circuit_breaker.record_failure()
             result['error'] = f"HTTP {response.status_code}: {response.text[:200]}"
